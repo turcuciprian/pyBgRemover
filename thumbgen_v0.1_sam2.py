@@ -1,61 +1,36 @@
 #!/usr/bin/env python3
 """
-thumbgen.py - Thumbnail-style image generator.
+thumbgen_v0.1_sam2.py - Thumbnail-style image generator.
 
-Takes a photo, removes the background (keeping the person/persons),
-draws a white outline around them, and places them back over the
-original background - which is blurred, darkened and faded.
+Takes a photo, removes the background (keeping the person/persons) using SAM 2
+automatic mask generation, draws a white outline around them, and places them
+back over the original background - which is blurred, darkened and faded.
 
 Saves 3 images next to the output path:
-    <output>.jpg              the final composite
-    <output>_outline.png      the person cutout with the outline border (transparent PNG)
-    <output>_background.jpg   just the faded/blurred/darkened background
+    <output>.jpg            the final composite
+    <output>_outline.png    the person cutout with the outline border (transparent PNG)
+    <output>_background.jpg just the faded/blurred/darkened background
 
 Usage:
-    python thumbgen.py input.jpg -o output.jpg
-    python thumbgen.py input.jpg -o output.jpg --outline 18 --blur 30 \
+    python thumbgen_v0.1_sam2.py input.jpg -o output.jpg
+    python thumbgen_v0.1_sam2.py input.jpg -o output.jpg --outline 18 --blur 30 \
         --darken 0.5 --fade 0.5
 """
 
 import argparse
-from PIL import Image, ImageEnhance, ImageFilter
-from rembg import new_session, remove
 from pathlib import Path
+
 import numpy as np
 import torch
-from ultralytics import YOLO
+from PIL import Image, ImageEnhance, ImageFilter
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 
-def cut_out_subject(img: Image.Image, model: str = "u2net_human_seg") -> Image.Image:
-    """Remove the background, keeping the person(s). Returns an RGBA image."""
-    session = new_session(model)
-    return remove(img, session=session)
-#!/usr/bin/env python3
-"""
-thumbgen.py - Thumbnail-style image generator.
-
-Takes a photo, removes the background (keeping the person/persons) using SAM 2 + YOLO,
-draws a white outline around them, and places them back over the
-original background - which is blurred, darkened and faded.
-
-Saves 3 images next to the output path:
-    <output>.jpg         the final composite
-    <output>_outline.png the person cutout with the outline border (transparent PNG)
-    <output>_background.jpg just the faded/blurred/darkened background
-
-Usage:
-    python thumbgen.py input.jpg -o output.jpg
-    python thumbgen.py input.jpg -o output.jpg --outline 18 --blur 30 --darken 0.5 --fade 0.5
-"""
-
-
-
-def load_sam2_predictor(
+def load_sam2_mask_generator(
     config_path: str = "configs/sam2.1/sam2.1_hiera_l.yaml",
     checkpoint_path: str = "sam2.1_hiera_large.pt",
-) -> SAM2ImagePredictor:
+) -> SAM2AutomaticMaskGenerator:
     """Initialize SAM 2 on available hardware (CUDA / MPS / CPU)."""
     device = (
         "cuda"
@@ -63,51 +38,45 @@ def load_sam2_predictor(
         else ("mps" if torch.backends.mps.is_available() else "cpu")
     )
     sam2_model = build_sam2(config_path, checkpoint_path, device=device)
-    return SAM2ImagePredictor(sam2_model)
+    return SAM2AutomaticMaskGenerator(sam2_model)
 
 
 def cut_out_subject(
     img: Image.Image,
-    predictor: SAM2ImagePredictor,
-    yolo_model_name: str = "yolov8x.pt",
+    mask_generator: SAM2AutomaticMaskGenerator,
 ) -> Image.Image:
-    """Detect person(s) with YOLO, segment with SAM 2, and return an RGBA cutout."""
+    """Segment the subject(s) with SAM 2 automatic mask generation.
+
+    Keeps masks overlapping the image-center region (falls back to the
+    largest mask if none do) and returns an RGBA cutout.
+    """
     np_img = np.array(img)
+    masks = mask_generator.generate(np_img)
 
-    # 1. Detect person bounding boxes using YOLO
-    yolo = YOLO(yolo_model_name)
-    results = yolo(np_img, verbose=False)
+    # Ignore masks that cover (almost) the whole image - they are background-like.
+    max_area = 0.9 * img.width * img.height
+    masks = [m for m in masks if m["area"] < max_area]
 
-    boxes = []
-    for r in results:
-        if r.boxes is None:
-            continue
-        for box, cls in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.cls.cpu().numpy()):
-            if int(cls) == 0:  # Class 0 = Person in COCO
-                boxes.append(box)
-
-    if not boxes:
-        print("Warning: No human detected by YOLO.")
+    if not masks:
+        print("Warning: No subject detected by SAM 2.")
         # Return transparent image
         return Image.new("RGBA", img.size, (0, 0, 0, 0))
 
-    # 2. Set image embedding in SAM 2
-    predictor.set_image(np_img)
+    # Keep masks overlapping the central window (middle 50% in both axes).
+    x0, x1 = img.width // 4, 3 * img.width // 4
+    y0, y1 = img.height // 4, 3 * img.height // 4
+    selected = [m for m in masks if m["segmentation"][y0:y1, x0:x1].any()]
 
-    # 3. Predict masks for all detected bounding boxes
-    boxes_np = np.array(boxes)
-    masks, scores, _ = predictor.predict(box=boxes_np, multimask_output=False)
+    # Fallback: nothing near the center -> take the single largest mask.
+    if not selected:
+        selected = [max(masks, key=lambda m: m["area"])]
 
-    # Combine all person masks into a single boolean array
+    # Combine all selected masks into a single boolean array
     combined_mask = np.zeros((img.height, img.width), dtype=bool)
-    if masks.ndim == 3:  # (N_boxes, H, W)
-        for m in masks:
-            combined_mask = np.logical_or(combined_mask, m)
-    elif masks.ndim == 4:  # (N_boxes, 1, H, W)
-        for m in masks:
-            combined_mask = np.logical_or(combined_mask, m[0])
+    for m in selected:
+        combined_mask = np.logical_or(combined_mask, m["segmentation"])
 
-    # 4. Construct RGBA image cutout
+    # Construct RGBA image cutout
     mask_pil = Image.fromarray((combined_mask * 255).astype(np.uint8), mode="L")
     fg = img.convert("RGBA")
     fg.putalpha(mask_pil)
@@ -132,8 +101,8 @@ def make_background(
 
 def prepare_mask(fg: Image.Image) -> Image.Image:
     """Refine mask edges.
-    
-    Since SAM 2 produces sharp boundaries without halo artifacts, 
+
+    Since SAM 2 produces sharp boundaries without halo artifacts,
     we use a soft, non-destructive edge pass.
     """
     mask = fg.getchannel("A").point(lambda p: 255 if p > 128 else 0)
@@ -147,7 +116,7 @@ def make_outline_mask(mask: Image.Image, thickness: int) -> Image.Image | None:
     """Dilate the subject mask iteratively to create a smooth outline region."""
     if thickness <= 0:
         return None
-    
+
     dilated = mask.copy()
     # Iterative 3x3 MaxFilter expansion avoids kernel overflow issues on large thickness
     for _ in range(thickness):
@@ -160,18 +129,17 @@ def make_outline_mask(mask: Image.Image, thickness: int) -> Image.Image | None:
 def process(
     input_path: str | Path,
     output_path: str | Path,
-    predictor: SAM2ImagePredictor,
+    mask_generator: SAM2AutomaticMaskGenerator,
     outline: int = 14,
     outline_color: tuple[int, int, int] = (255, 255, 255),
     blur: float = 25,
     darken: float = 0.55,
     fade: float = 0.4,
-    yolo_model: str = "yolov8x.pt",
 ) -> None:
     img = Image.open(input_path).convert("RGB")
 
     # 1. Keep the person(s), drop the background using SAM 2
-    fg = cut_out_subject(img, predictor, yolo_model_name=yolo_model)
+    fg = cut_out_subject(img, mask_generator)
     mask = prepare_mask(fg)
     if mask.getbbox() is None:
         print("Warning: no subject detected - output will be background only.")
@@ -184,7 +152,7 @@ def process(
     # 3. White outline behind the subject.
     outline_mask = make_outline_mask(mask, outline)
     silhouette = Image.new("RGBA", img.size, (*outline_color, 255))
-    
+
     if outline_mask is not None:
         result.paste(silhouette, (0, 0), outline_mask)
 
@@ -260,11 +228,6 @@ def parse_args() -> argparse.Namespace:
         default="sam2.1_hiera_large.pt",
         help="SAM 2 checkpoint path",
     )
-    p.add_argument(
-        "--yolo-model",
-        default="yolov8x.pt",
-        help="YOLO model for person bounding box detection (default: yolov8x.pt)",
-    )
     return p.parse_args()
 
 
@@ -279,19 +242,18 @@ def main() -> None:
         stem = Path(args.input)
         output = str(stem.with_name(stem.stem + "_thumb.jpg"))
 
-    # Load SAM 2 predictor
-    predictor = load_sam2_predictor(args.sam2_config, args.sam2_ckpt)
+    # Load SAM 2 mask generator
+    mask_generator = load_sam2_mask_generator(args.sam2_config, args.sam2_ckpt)
 
     process(
         args.input,
         output,
-        predictor,
+        mask_generator,
         outline=args.outline,
         outline_color=color,
         blur=args.blur,
         darken=args.darken,
         fade=args.fade,
-        yolo_model=args.yolo_model,
     )
 
 
