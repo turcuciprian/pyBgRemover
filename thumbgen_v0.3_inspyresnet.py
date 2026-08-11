@@ -81,7 +81,7 @@ if __name__ == "__main__":
         (("-o", "--output"), {"help": "Output image path"}),
         (("--outline",), {"type": int, "default": 14, "help": "Outline thickness (0=none)"}),
         (("--outlinecolor",), {"default": "#fff", "help": "Hex white color. the string here should be a hex value with the # before it"}),
-        (("--blur",), {"type": float, "default": 25.0, "help": "Background blur radius"}),
+        (("--blur",), {"type": float, "default": 5.0, "help": "Background blur radius"}),
         (("--darken",), {"type": float, "default": 0.55, "help": "Background brightness (0-1)"}),
         (("--fade",), {"type": float, "default": 0.4, "help": "Background fade/desaturation (0-1)"}),
         (("--mode",), {
