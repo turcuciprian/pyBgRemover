@@ -2,3 +2,4 @@ local_env
 images/
 *.pt
 .DS_Store
+__pycache__
